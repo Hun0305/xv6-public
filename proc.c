@@ -6,6 +6,9 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct {
   struct spinlock lock;
@@ -19,6 +22,8 @@ extern void forkret(void);
 extern void trapret(void);
 
 static void wakeup1(void *chan);
+
+struct mmap_area ma[64] = { 0 };
 
 void
 pinit(void)
@@ -211,6 +216,61 @@ fork(void)
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
   pid = np->pid;
+
+  for (int i = 0; i < 64; i++) {
+    if (ma[i].p == curproc && ma[i].present == 1) {
+      for (int j = 0; j < 64; j++) {
+        if (ma[j].present == 0) {
+          if (ma[i].f != 0) {
+            ma[j].f = ma[i].f;
+            filedup(ma[j].f);
+            ma[j].f->off = ma[i].offset;  
+          }
+          ma[j].addr = ma[i].addr;
+          ma[j].flags = ma[i].flags;
+          ma[j].length = ma[i].length;
+          ma[j].p = np;
+          ma[j].present = 1;
+          ma[j].prot = ma[i].prot;
+          ma[j].offset = ma[i].offset;
+
+          pte_t *pte;
+          uint flags;
+          uint ptr = 0;
+          char *mem;
+
+          for(ptr = ma[j].addr; ptr < ma[j].addr + ma[j].length; ptr += PGSIZE) {
+            if((pte = walkpgdir(curproc->pgdir, (void *)ptr, 0)) == 0) {
+              // cprintf("fork: pte should exist\n");
+              return -1;
+            }
+              
+            if(!(*pte & PTE_P)) {
+              // cprintf("fork: page not present\n");
+              return -1;
+            }
+
+            flags = PTE_FLAGS(*pte);
+            if((mem = kalloc()) == 0) {
+              // cprintf("fork: kalloc failed");
+              return -1;
+            }
+
+            memset((void *)mem, 0, PGSIZE);
+
+            memmove(mem, (void *)ptr, PGSIZE);
+
+            if(mappages(np->pgdir, (void*)ptr, PGSIZE, V2P(mem), flags) < 0) {
+              // cprintf("fork: mappages failed");
+              return -1;
+            }
+          }
+
+          break;
+        }
+      }
+    }
+  }
 
   acquire(&ptable.lock);
 
@@ -531,4 +591,258 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+uint
+mmap(uint addr, int length, int prot, int flags, int fd, int offset) {
+
+  struct proc *p = myproc();
+  struct file *f = 0;
+  if (fd != -1)
+    f = p->ofile[fd];
+
+  int read = 0;
+  int write = 0;
+
+  if (prot & PROT_READ)
+    read = 1;
+  if (prot & PROT_WRITE)
+    write = 1;
+
+  int anonymous = 0;
+  int populate = 0;
+
+  if (flags & MAP_ANONYMOUS)
+    anonymous = 1;
+  if (flags & MAP_POPULATE)
+    populate = 1;
+
+  if (anonymous == 0 && fd == -1) {
+    // cprintf("It's not anonymous, but when the fd is -1\n");
+    return 0;
+  }
+  if (f != 0 && (read != f->readable || write != f->writable)) {
+    // cprintf("The protection of the file and the prot of the parameter are different\n");
+    return 0;
+  }
+
+  int i = 0;
+  for (i = 0; (ma[i].present != 0) && i < 64; i++);
+  if (i == 64) {
+    // cprintf("There are no empty space in mmap_area\n");
+    return 0;
+  }
+
+  uint start_addr = MMAPBASE + addr;
+  
+  if (f != 0) {
+    filedup(f);
+    ma[i].f = f;
+  }
+  ma[i].addr = start_addr;
+  ma[i].flags = flags;
+  ma[i].length = length;
+  ma[i].prot = prot;
+  ma[i].p = p;
+  ma[i].offset = offset;
+  ma[i].present = 1;
+
+  if (populate == 0) {
+    // cprintf("just record its mapping area\n");
+    return start_addr;
+  }
+
+  if (populate == 1) {
+    if (anonymous == 0) { // file mapping
+      f->off = offset;
+      uint ptr = 0; 
+      char *new_physical_page = 0;
+
+      for (ptr = start_addr; ptr < start_addr + length; ptr += PGSIZE) {
+        new_physical_page = kalloc();
+        if (new_physical_page == 0) {
+          // cprintf("Failed to allocate physical page in file mapping\n");
+          return 0;
+        }
+
+        memset(new_physical_page, 0, PGSIZE);
+        fileread(f, new_physical_page, PGSIZE);
+
+        if (mappages(p->pgdir, (void *)ptr, PGSIZE, V2P(new_physical_page), prot | PTE_U) == -1) {
+          // cprintf("Failed to mappages in file mapping\n");
+          return 0;
+        }
+          
+      }
+
+      return start_addr;
+    }
+
+    else if (anonymous == 1) { // anonymous mapping
+      uint ptr = 0; 
+      char *new_physical_page = 0;
+
+      for (ptr = start_addr; ptr < start_addr + length; ptr += PGSIZE) {
+        new_physical_page = kalloc();
+        if (new_physical_page == 0) {
+          // cprintf("Failed to allocate physical page in anonymous mapping\n");
+          return 0;
+        }
+
+        memset(new_physical_page, 0, PGSIZE);
+
+        if (mappages(p->pgdir, (void *)ptr, PGSIZE, V2P(new_physical_page), prot | PTE_U) == -1) {
+          // cprintf("Failed to mappages in anonymous mapping\n");
+          return 0;
+        } 
+      }
+
+      return start_addr;
+    }
+  }
+  
+  return start_addr;
+}
+
+int
+pfh(uint addr, uint err) {
+  struct proc *p = myproc();
+  
+  int read = 0;
+  int write = 0;
+  if ((err&2) == 0)
+    read = PROT_READ;
+  if ((err&2) == 2)
+    write = PROT_WRITE;
+
+  int ma_idx = -1;
+
+  for (int i = 0; i < 64; i++) {
+    if ((ma[i].addr <= addr) && (addr <= (ma[i].addr + ma[i].length))) {
+      if (ma[i].present == 1 && ma[i].p == p) {
+        ma_idx = i;
+        break;
+      }
+    }
+  }
+
+  if (ma_idx == -1) {
+    // cprintf("Corresponding mmap_area is not found\n");
+    return -1;
+  }
+
+  if (((ma[ma_idx].prot & PROT_READ) != read) || ((ma[ma_idx].prot & PROT_WRITE) != write)) {
+    // cprintf("tf->err and prot in mmap_area is not same\n");
+    return -1;
+  }
+
+  int anonymous = 0;
+  if (ma[ma_idx].flags & MAP_ANONYMOUS)
+    anonymous = 1;
+
+  if (anonymous == 0) { // file mapping
+      struct file *f = ma[ma_idx].f;
+      f->off = ma[ma_idx].offset;
+      uint ptr = 0; 
+      char *new_physical_page = 0;
+
+      for (ptr = ma[ma_idx].addr; ptr < ma[ma_idx].addr + ma[ma_idx].length; ptr += PGSIZE) {
+        new_physical_page = kalloc();
+        if (new_physical_page == 0) {
+          // cprintf("Failed to allocate physical page in file mapping\n");
+          return -1;
+        }
+
+        memset(new_physical_page, 0, PGSIZE);
+        fileread(f, new_physical_page, PGSIZE);
+
+        if (mappages(p->pgdir, (void *)ptr, PGSIZE, V2P(new_physical_page), ma[ma_idx].prot | PTE_U) == -1) {
+          // cprintf("Failed to mappages in file mapping\n");
+          return -1;
+        }
+          
+      }
+
+      return 0;
+    }
+
+    else if (anonymous == 1) { // anonymous mapping
+      uint ptr = 0; 
+      char *new_physical_page = 0;
+
+      for (ptr = ma[ma_idx].addr; ptr < ma[ma_idx].addr + ma[ma_idx].length; ptr += PGSIZE) {
+        new_physical_page = kalloc();
+        if (new_physical_page == 0) {
+          // cprintf("Failed to allocate physical page in anonymous mapping\n");
+          return -1;
+        }
+
+        memset(new_physical_page, 0, PGSIZE);
+
+        if (mappages(p->pgdir, (void *)ptr, PGSIZE, V2P(new_physical_page), ma[ma_idx].prot | PTE_U) == -1) {
+          // cprintf("Failed to mappages in anonymous mapping\n");
+          return -1;
+        } 
+      }
+
+      return 0;
+    }
+
+    return 0;
+}
+
+int
+munmap(uint addr) {
+  struct proc *p = myproc();
+  int ma_idx = -1;
+
+  for (int i = 0; i < 64; i++) {
+    if (ma[i].addr == addr) {
+      if (ma[i].present == 1 && ma[i].p == p) {
+        ma_idx = i;
+        break;
+      }
+    }
+  }
+
+  if (ma_idx == -1) {
+    // cprintf("Corresponding mmap_area is not found\n");
+    return -1;
+  }
+
+  pte_t *TBF_page = 0;
+  uint ptr = 0;
+
+  for (ptr = ma[ma_idx].addr; ptr < ma[ma_idx].addr + ma[ma_idx].length; ptr += PGSIZE) {
+    TBF_page = walkpgdir(p->pgdir, (void *)ptr, 0);
+      if (TBF_page == 0) {
+        // cprintf("To Be Free Page is not found by walkpdgir");
+        continue;
+      }
+      if ((*TBF_page & PTE_P) == 0) {
+        // cprintf("TBF_page is not physically allocated");
+        continue;
+      }
+    uint pa = PTE_ADDR(*TBF_page);
+    char *v = P2V(pa);
+    memset((void *)v, 1, PGSIZE);
+    kfree(v);
+
+    *TBF_page = 0;
+  }
+
+  ma[ma_idx].f = 0;
+  ma[ma_idx].addr = 0;
+  ma[ma_idx].length = 0;
+  ma[ma_idx].offset = 0;
+  ma[ma_idx].prot = 0;
+  ma[ma_idx].flags = 0;
+  ma[ma_idx].p = 0;
+  ma[ma_idx].present = 0;
+
+  return 1;
+}
+
+int freemem(void) {
+  return getFree();
 }

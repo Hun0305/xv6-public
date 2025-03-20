@@ -68,6 +68,7 @@ char*           kalloc(void);
 void            kfree(char*);
 void            kinit1(void*, void*);
 void            kinit2(void*, void*);
+int             getFree(void);
 
 // kbd.c
 void            kbdintr(void);
@@ -120,6 +121,10 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
+uint            mmap(uint, int, int, int, int, int);
+int             munmap(uint);
+int             freemem(void);
+int             pfh(uint, uint);
 
 // swtch.S
 void            swtch(struct context**, struct context*);
@@ -173,6 +178,8 @@ void            uartputc(int);
 // vm.c
 void            seginit(void);
 void            kvmalloc(void);
+pte_t *         walkpgdir(pde_t *pgdir, const void *va, int alloc);
+int             mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm);
 pde_t*          setupkvm(void);
 char*           uva2ka(pde_t*, char*);
 int             allocuvm(pde_t*, uint, uint);
